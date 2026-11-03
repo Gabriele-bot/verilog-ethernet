@@ -1,3 +1,5 @@
+`resetall `timescale 1ns / 1ps `default_nettype none
+
 module udp_complete_opt #(
   // Width of AXI stream interfaces in bits
   parameter DATA_WIDTH = 8,
@@ -1727,7 +1729,6 @@ module udp_complete_opt #(
     .m_axis_tuser (m_network_axis_tuser)
   );
 
-
-
-
 endmodule
+
+`resetall
