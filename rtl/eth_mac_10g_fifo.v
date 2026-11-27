@@ -33,6 +33,7 @@ THE SOFTWARE.
  */
 module eth_mac_10g_fifo #
 (
+    parameter LOCAL_MAC_ADDRESS = 48'h02_00_00_00_00_00,
     parameter DATA_WIDTH = 64,
     parameter CTRL_WIDTH = (DATA_WIDTH/8),
     parameter AXIS_DATA_WIDTH = DATA_WIDTH,
@@ -53,6 +54,8 @@ module eth_mac_10g_fifo #
     parameter RX_DROP_OVERSIZE_FRAME = RX_FRAME_FIFO,
     parameter RX_DROP_BAD_FRAME = RX_DROP_OVERSIZE_FRAME,
     parameter RX_DROP_WHEN_FULL = RX_DROP_OVERSIZE_FRAME,
+    parameter PFC_ENABLE = 0,
+    parameter PAUSE_ENABLE = PFC_ENABLE,
     parameter PTP_TS_ENABLE = 0,
     parameter PTP_TS_FMT_TOD = 1,
     parameter PTP_TS_WIDTH = PTP_TS_FMT_TOD ? 96 : 64,
@@ -122,6 +125,28 @@ module eth_mac_10g_fifo #
     output wire                       rx_fifo_good_frame,
 
     /*
+    Pause interface
+    */
+
+    /*
+     * Link-level Flow Control (LFC) (IEEE 802.3 annex 31B PAUSE)
+     */
+    input  wire                       tx_lfc_en,
+    input  wire                       tx_lfc_req,
+    input  wire                       tx_lfc_resend,
+    input  wire                       rx_lfc_en,
+    output wire                       rx_lfc_req, // global pause handled
+
+    /*
+     * Priority Flow Control (PFC) (IEEE 802.3 annex 31D PFC)
+     */
+    input  wire [7:0]                 tx_pfc_en,
+    input  wire [7:0]                 tx_pfc_req,
+    input  wire                       tx_pfc_resend,
+    input  wire [7:0]                 rx_pfc_en,
+    output wire [7:0]                 rx_pfc_req,
+    input  wire [7:0]                 rx_pfc_ack,
+    /*
      * PTP clock
      */
     input  wire [PTP_TS_WIDTH-1:0]    ptp_ts_96,
@@ -132,356 +157,441 @@ module eth_mac_10g_fifo #
      */
     input  wire [7:0]                 cfg_ifg,
     input  wire                       cfg_tx_enable,
-    input  wire                       cfg_rx_enable
+    input  wire                       cfg_rx_enable,
+    input  wire [47:0]                cfg_local_mac
 );
 
-parameter KEEP_WIDTH = DATA_WIDTH/8;
+    parameter KEEP_WIDTH = DATA_WIDTH/8;
 
-wire [DATA_WIDTH-1:0]      tx_fifo_axis_tdata;
-wire [KEEP_WIDTH-1:0]      tx_fifo_axis_tkeep;
-wire                       tx_fifo_axis_tvalid;
-wire                       tx_fifo_axis_tready;
-wire                       tx_fifo_axis_tlast;
-wire [TX_USER_WIDTH-1:0]   tx_fifo_axis_tuser;
+    parameter MAC_MULTICAST_ADDRESS = 48'h01_80_C2_00_00_01;
 
-wire [DATA_WIDTH-1:0]      rx_fifo_axis_tdata;
-wire [KEEP_WIDTH-1:0]      rx_fifo_axis_tkeep;
-wire                       rx_fifo_axis_tvalid;
-wire                       rx_fifo_axis_tlast;
-wire [RX_USER_WIDTH-1:0]   rx_fifo_axis_tuser;
+    parameter MAC_CONTROL_FRAME_ETH_TYPE = 16'h8808;
 
-wire [PTP_TS_WIDTH-1:0]    tx_ptp_ts_96;
-wire [PTP_TS_WIDTH-1:0]    rx_ptp_ts_96;
+    parameter LFC_OPCODE = 16'h0001;
+    parameter PFC_OPCODE = 16'h0101;
 
-wire [PTP_TS_WIDTH-1:0]    tx_axis_ptp_ts_96;
-wire [PTP_TAG_WIDTH-1:0]   tx_axis_ptp_ts_tag;
-wire                       tx_axis_ptp_ts_valid;
+    parameter LFC_QUANTA  = 16'hffff;
+    parameter LFC_REFRESH = 16'h7fff;
+    parameter PFC_QUANTA  = {16'hffff, 16'hffff, 16'hffff, 16'hffff, 16'hffff, 16'hffff, 16'hffff, 16'hffff};
+    parameter PFC_REFRESH = {16'h7fff, 16'h7fff, 16'h7fff, 16'h7fff, 16'h7fff, 16'h7fff, 16'h7fff, 16'h7fff};
 
-// synchronize MAC status signals into logic clock domain
-wire tx_error_underflow_int;
+    wire [DATA_WIDTH-1:0]      tx_fifo_axis_tdata;
+    wire [KEEP_WIDTH-1:0]      tx_fifo_axis_tkeep;
+    wire                       tx_fifo_axis_tvalid;
+    wire                       tx_fifo_axis_tready;
+    wire                       tx_fifo_axis_tlast;
+    wire [TX_USER_WIDTH-1:0]   tx_fifo_axis_tuser;
 
-reg [0:0] tx_sync_reg_1 = 1'b0;
-reg [0:0] tx_sync_reg_2 = 1'b0;
-reg [0:0] tx_sync_reg_3 = 1'b0;
-reg [0:0] tx_sync_reg_4 = 1'b0;
+    wire [DATA_WIDTH-1:0]      rx_fifo_axis_tdata;
+    wire [KEEP_WIDTH-1:0]      rx_fifo_axis_tkeep;
+    wire                       rx_fifo_axis_tvalid;
+    wire                       rx_fifo_axis_tlast;
+    wire [RX_USER_WIDTH-1:0]   rx_fifo_axis_tuser;
 
-assign tx_error_underflow = tx_sync_reg_3[0] ^ tx_sync_reg_4[0];
+    wire [PTP_TS_WIDTH-1:0]    tx_ptp_ts_96;
+    wire [PTP_TS_WIDTH-1:0]    rx_ptp_ts_96;
 
-always @(posedge tx_clk or posedge tx_rst) begin
-    if (tx_rst) begin
-        tx_sync_reg_1 <= 1'b0;
-    end else begin
-        tx_sync_reg_1 <= tx_sync_reg_1 ^ {tx_error_underflow_int};
+    wire [PTP_TS_WIDTH-1:0]    tx_axis_ptp_ts_96;
+    wire [PTP_TAG_WIDTH-1:0]   tx_axis_ptp_ts_tag;
+    wire                       tx_axis_ptp_ts_valid;
+
+    // synchronize MAC status signals into logic clock domain
+    wire tx_error_underflow_int;
+
+    reg [0:0] tx_sync_reg_1 = 1'b0;
+    reg [0:0] tx_sync_reg_2 = 1'b0;
+    reg [0:0] tx_sync_reg_3 = 1'b0;
+    reg [0:0] tx_sync_reg_4 = 1'b0;
+
+    assign tx_error_underflow = tx_sync_reg_3[0] ^ tx_sync_reg_4[0];
+
+
+    always @(posedge tx_clk or posedge tx_rst) begin
+        if (tx_rst) begin
+            tx_sync_reg_1 <= 1'b0;
+        end else begin
+            tx_sync_reg_1 <= tx_sync_reg_1 ^ {tx_error_underflow_int};
+        end
     end
-end
 
-always @(posedge logic_clk or posedge logic_rst) begin
-    if (logic_rst) begin
-        tx_sync_reg_2 <= 1'b0;
-        tx_sync_reg_3 <= 1'b0;
-        tx_sync_reg_4 <= 1'b0;
-    end else begin
-        tx_sync_reg_2 <= tx_sync_reg_1;
-        tx_sync_reg_3 <= tx_sync_reg_2;
-        tx_sync_reg_4 <= tx_sync_reg_3;
+    always @(posedge logic_clk or posedge logic_rst) begin
+        if (logic_rst) begin
+            tx_sync_reg_2 <= 1'b0;
+            tx_sync_reg_3 <= 1'b0;
+            tx_sync_reg_4 <= 1'b0;
+        end else begin
+            tx_sync_reg_2 <= tx_sync_reg_1;
+            tx_sync_reg_3 <= tx_sync_reg_2;
+            tx_sync_reg_4 <= tx_sync_reg_3;
+        end
     end
-end
 
-wire rx_error_bad_frame_int;
-wire rx_error_bad_fcs_int;
+    wire rx_error_bad_frame_int;
+    wire rx_error_bad_fcs_int;
 
-reg [1:0] rx_sync_reg_1 = 2'd0;
-reg [1:0] rx_sync_reg_2 = 2'd0;
-reg [1:0] rx_sync_reg_3 = 2'd0;
-reg [1:0] rx_sync_reg_4 = 2'd0;
+    reg [1:0] rx_sync_reg_1 = 2'd0;
+    reg [1:0] rx_sync_reg_2 = 2'd0;
+    reg [1:0] rx_sync_reg_3 = 2'd0;
+    reg [1:0] rx_sync_reg_4 = 2'd0;
 
-assign rx_error_bad_frame = rx_sync_reg_3[0] ^ rx_sync_reg_4[0];
-assign rx_error_bad_fcs = rx_sync_reg_3[1] ^ rx_sync_reg_4[1];
 
-always @(posedge rx_clk or posedge rx_rst) begin
-    if (rx_rst) begin
-        rx_sync_reg_1 <= 2'd0;
-    end else begin
-        rx_sync_reg_1 <= rx_sync_reg_1 ^ {rx_error_bad_fcs_int, rx_error_bad_frame_int};
+    assign rx_error_bad_frame = rx_sync_reg_3[0] ^ rx_sync_reg_4[0];
+    assign rx_error_bad_fcs = rx_sync_reg_3[1] ^ rx_sync_reg_4[1];
+
+    always @(posedge rx_clk or posedge rx_rst) begin
+        if (rx_rst) begin
+            rx_sync_reg_1 <= 2'd0;
+        end else begin
+            rx_sync_reg_1 <= rx_sync_reg_1 ^ {rx_error_bad_fcs_int, rx_error_bad_frame_int};
+        end
     end
-end
 
-always @(posedge logic_clk or posedge logic_rst) begin
-    if (logic_rst) begin
-        rx_sync_reg_2 <= 2'd0;
-        rx_sync_reg_3 <= 2'd0;
-        rx_sync_reg_4 <= 2'd0;
-    end else begin
-        rx_sync_reg_2 <= rx_sync_reg_1;
-        rx_sync_reg_3 <= rx_sync_reg_2;
-        rx_sync_reg_4 <= rx_sync_reg_3;
+    always @(posedge logic_clk or posedge logic_rst) begin
+        if (logic_rst) begin
+            rx_sync_reg_2 <= 2'd0;
+            rx_sync_reg_3 <= 2'd0;
+            rx_sync_reg_4 <= 2'd0;
+        end else begin
+            rx_sync_reg_2 <= rx_sync_reg_1;
+            rx_sync_reg_3 <= rx_sync_reg_2;
+            rx_sync_reg_4 <= rx_sync_reg_3;
+        end
     end
-end
 
-// PTP timestamping
-generate
 
-if (PTP_TS_ENABLE) begin : tx_ptp
-    
-    ptp_clock_cdc #(
-        .TS_WIDTH(PTP_TS_WIDTH),
-        .NS_WIDTH(6)
+    // PTP timestamping
+    generate
+
+        if (PTP_TS_ENABLE) begin : tx_ptp
+
+            ptp_clock_cdc #(
+                .TS_WIDTH(PTP_TS_WIDTH),
+                .NS_WIDTH(6)
+            )
+            tx_ptp_cdc (
+                .input_clk(logic_clk),
+                .input_rst(logic_rst),
+                .output_clk(tx_clk),
+                .output_rst(tx_rst),
+                .sample_clk(ptp_sample_clk),
+                .input_ts(ptp_ts_96),
+                .input_ts_step(ptp_ts_step),
+                .output_ts(tx_ptp_ts_96),
+                .output_ts_step(),
+                .output_pps(),
+                .locked()
+            );
+
+            axis_async_fifo #(
+                .DEPTH(TX_PTP_TS_FIFO_DEPTH),
+                .DATA_WIDTH(PTP_TS_WIDTH),
+                .KEEP_ENABLE(0),
+                .LAST_ENABLE(0),
+                .ID_ENABLE(TX_PTP_TAG_ENABLE),
+                .ID_WIDTH(PTP_TAG_WIDTH),
+                .DEST_ENABLE(0),
+                .USER_ENABLE(0),
+                .FRAME_FIFO(0)
+            )
+            tx_ptp_ts_fifo (
+                // AXI input
+                .s_clk(tx_clk),
+                .s_rst(tx_rst),
+                .s_axis_tdata(tx_axis_ptp_ts_96),
+                .s_axis_tkeep(0),
+                .s_axis_tvalid(tx_axis_ptp_ts_valid),
+                .s_axis_tready(),
+                .s_axis_tlast(0),
+                .s_axis_tid(tx_axis_ptp_ts_tag),
+                .s_axis_tdest(0),
+                .s_axis_tuser(0),
+
+                // AXI output
+                .m_clk(logic_clk),
+                .m_rst(logic_rst),
+                .m_axis_tdata(m_axis_tx_ptp_ts_96),
+                .m_axis_tkeep(),
+                .m_axis_tvalid(m_axis_tx_ptp_ts_valid),
+                .m_axis_tready(m_axis_tx_ptp_ts_ready),
+                .m_axis_tlast(),
+                .m_axis_tid(m_axis_tx_ptp_ts_tag),
+                .m_axis_tdest(),
+                .m_axis_tuser(),
+
+                // Status
+                .s_status_overflow(),
+                .s_status_bad_frame(),
+                .s_status_good_frame(),
+                .m_status_overflow(),
+                .m_status_bad_frame(),
+                .m_status_good_frame()
+            );
+
+        end else begin
+
+            assign m_axis_tx_ptp_ts_96 = {PTP_TS_WIDTH{1'b0}};
+            assign m_axis_tx_ptp_ts_tag = {PTP_TAG_WIDTH{1'b0}};
+            assign m_axis_tx_ptp_ts_valid = 1'b0;
+
+            assign tx_ptp_ts_96 = {PTP_TS_WIDTH{1'b0}};
+
+        end
+
+        if (PTP_TS_ENABLE) begin : rx_ptp
+
+            ptp_clock_cdc #(
+                .TS_WIDTH(PTP_TS_WIDTH),
+                .NS_WIDTH(6)
+            )
+            rx_ptp_cdc (
+                .input_clk(logic_clk),
+                .input_rst(logic_rst),
+                .output_clk(rx_clk),
+                .output_rst(rx_rst),
+                .sample_clk(ptp_sample_clk),
+                .input_ts(ptp_ts_96),
+                .input_ts_step(ptp_ts_step),
+                .output_ts(rx_ptp_ts_96),
+                .output_ts_step(),
+                .output_pps(),
+                .locked()
+            );
+
+        end else begin
+
+            assign rx_ptp_ts_96 = {PTP_TS_WIDTH{1'b0}};
+
+        end
+
+    endgenerate
+
+    eth_mac_10g #(
+        .DATA_WIDTH(DATA_WIDTH),
+        .KEEP_WIDTH(KEEP_WIDTH),
+        .CTRL_WIDTH(CTRL_WIDTH),
+        .ENABLE_PADDING(ENABLE_PADDING),
+        .ENABLE_DIC(ENABLE_DIC),
+        .MIN_FRAME_LENGTH(MIN_FRAME_LENGTH),
+        .PTP_TS_ENABLE(PTP_TS_ENABLE),
+        .PTP_TS_FMT_TOD(PTP_TS_FMT_TOD),
+        .PTP_TS_WIDTH(PTP_TS_WIDTH),
+        .TX_PTP_TS_CTRL_IN_TUSER(TX_PTP_TS_CTRL_IN_TUSER),
+        .TX_PTP_TAG_ENABLE(TX_PTP_TAG_ENABLE),
+        .TX_PTP_TAG_WIDTH(PTP_TAG_WIDTH),
+        .TX_USER_WIDTH(TX_USER_WIDTH),
+        .RX_USER_WIDTH(RX_USER_WIDTH),
+        .PFC_ENABLE(PFC_ENABLE),
+        .PAUSE_ENABLE(PAUSE_ENABLE)
     )
-    tx_ptp_cdc (
-        .input_clk(logic_clk),
-        .input_rst(logic_rst),
-        .output_clk(tx_clk),
-        .output_rst(tx_rst),
-        .sample_clk(ptp_sample_clk),
-        .input_ts(ptp_ts_96),
-        .input_ts_step(ptp_ts_step),
-        .output_ts(tx_ptp_ts_96),
-        .output_ts_step(),
-        .output_pps(),
-        .locked()
+    eth_mac_10g_inst (
+        .tx_clk(tx_clk),
+        .tx_rst(tx_rst),
+        .rx_clk(rx_clk),
+        .rx_rst(rx_rst),
+
+        .tx_axis_tdata(tx_fifo_axis_tdata),
+        .tx_axis_tkeep(tx_fifo_axis_tkeep),
+        .tx_axis_tvalid(tx_fifo_axis_tvalid),
+        .tx_axis_tready(tx_fifo_axis_tready),
+        .tx_axis_tlast(tx_fifo_axis_tlast),
+        .tx_axis_tuser(tx_fifo_axis_tuser),
+
+        .rx_axis_tdata(rx_fifo_axis_tdata),
+        .rx_axis_tkeep(rx_fifo_axis_tkeep),
+        .rx_axis_tvalid(rx_fifo_axis_tvalid),
+        .rx_axis_tlast(rx_fifo_axis_tlast),
+        .rx_axis_tuser(rx_fifo_axis_tuser),
+
+        .xgmii_rxd(xgmii_rxd),
+        .xgmii_rxc(xgmii_rxc),
+        .xgmii_txd(xgmii_txd),
+        .xgmii_txc(xgmii_txc),
+
+        .tx_ptp_ts(tx_ptp_ts_96),
+        .rx_ptp_ts(rx_ptp_ts_96),
+        .tx_axis_ptp_ts(tx_axis_ptp_ts_96),
+        .tx_axis_ptp_ts_tag(tx_axis_ptp_ts_tag),
+        .tx_axis_ptp_ts_valid(tx_axis_ptp_ts_valid),
+
+        /*
+         * Link-level Flow Control (LFC) (IEEE 802.3 annex 31B PAUSE)
+         */
+        .tx_lfc_req(tx_lfc_req),
+        .tx_lfc_resend(tx_lfc_resend),
+        .rx_lfc_en(rx_lfc_en),
+        .rx_lfc_req(rx_lfc_req),
+        .rx_lfc_ack(1'b0), //handled interlally
+
+        /*
+         * Priority Flow Control (PFC) (IEEE 802.3 annex 31D PFC)
+         */
+        .tx_pfc_req(tx_pfc_req & tx_pfc_en),
+        .tx_pfc_resend(tx_pfc_resend),
+        .rx_pfc_en(rx_pfc_en),
+        .rx_pfc_req(rx_pfc_req),
+        .rx_pfc_ack(rx_pfc_ack),
+
+        /*
+         * Pause interface
+         */
+        .tx_lfc_pause_en(tx_lfc_en),
+        .tx_pause_req(1'b0),
+        .tx_pause_ack(),
+
+        .tx_error_underflow(tx_error_underflow_int),
+        .rx_error_bad_frame(rx_error_bad_frame_int),
+        .rx_error_bad_fcs(rx_error_bad_fcs_int),
+
+        /*
+         * Configuration
+         */
+        .cfg_ifg(cfg_ifg),
+        .cfg_tx_enable(cfg_tx_enable),
+        .cfg_rx_enable(cfg_rx_enable),
+
+        .cfg_mcf_rx_eth_dst_mcast(MAC_MULTICAST_ADDRESS),
+        .cfg_mcf_rx_check_eth_dst_mcast(1'b1),
+        .cfg_mcf_rx_eth_dst_ucast(48'd0),
+        .cfg_mcf_rx_check_eth_dst_ucast(1'b0),
+        .cfg_mcf_rx_eth_src(48'h0),
+        .cfg_mcf_rx_check_eth_src(1'b0),
+        .cfg_mcf_rx_eth_type(MAC_CONTROL_FRAME_ETH_TYPE),
+        .cfg_mcf_rx_opcode_lfc(LFC_OPCODE),
+        .cfg_mcf_rx_check_opcode_lfc(rx_lfc_en),
+        .cfg_mcf_rx_opcode_pfc(PFC_OPCODE),
+        .cfg_mcf_rx_check_opcode_pfc(|rx_pfc_en),
+        .cfg_mcf_rx_forward(1'b0),
+        .cfg_mcf_rx_enable(rx_lfc_en | (|rx_pfc_en)),
+        .cfg_tx_lfc_eth_dst(MAC_MULTICAST_ADDRESS),
+        .cfg_tx_lfc_eth_src(cfg_local_mac),
+        .cfg_tx_lfc_eth_type(MAC_CONTROL_FRAME_ETH_TYPE),
+        .cfg_tx_lfc_opcode(LFC_OPCODE),
+        .cfg_tx_lfc_en(tx_lfc_en),
+        .cfg_tx_lfc_quanta(LFC_QUANTA),
+        .cfg_tx_lfc_refresh(LFC_REFRESH),
+        .cfg_tx_pfc_eth_dst(MAC_MULTICAST_ADDRESS),
+        .cfg_tx_pfc_eth_src(cfg_local_mac),
+        .cfg_tx_pfc_eth_type(MAC_CONTROL_FRAME_ETH_TYPE),
+        .cfg_tx_pfc_opcode(PFC_OPCODE),
+        .cfg_tx_pfc_en(|(tx_pfc_en)),
+        .cfg_tx_pfc_quanta(PFC_QUANTA),
+        .cfg_tx_pfc_refresh(PFC_REFRESH),
+        .cfg_rx_lfc_opcode(LFC_OPCODE),
+        .cfg_rx_lfc_en(rx_lfc_en),
+        .cfg_rx_pfc_opcode(PFC_OPCODE),
+        .cfg_rx_pfc_en(|rx_pfc_en)
     );
 
-    axis_async_fifo #(
-        .DEPTH(TX_PTP_TS_FIFO_DEPTH),
-        .DATA_WIDTH(PTP_TS_WIDTH),
-        .KEEP_ENABLE(0),
-        .LAST_ENABLE(0),
-        .ID_ENABLE(TX_PTP_TAG_ENABLE),
-        .ID_WIDTH(PTP_TAG_WIDTH),
+
+    axis_async_fifo_adapter #(
+        .DEPTH(TX_FIFO_DEPTH),
+        .S_DATA_WIDTH(AXIS_DATA_WIDTH),
+        .S_KEEP_ENABLE(AXIS_KEEP_ENABLE),
+        .S_KEEP_WIDTH(AXIS_KEEP_WIDTH),
+        .M_DATA_WIDTH(DATA_WIDTH),
+        .M_KEEP_ENABLE(1),
+        .M_KEEP_WIDTH(KEEP_WIDTH),
+        .ID_ENABLE(0),
         .DEST_ENABLE(0),
-        .USER_ENABLE(0),
-        .FRAME_FIFO(0)
+        .USER_ENABLE(1),
+        .USER_WIDTH(TX_USER_WIDTH),
+        .RAM_PIPELINE(TX_FIFO_RAM_PIPELINE),
+        .FRAME_FIFO(TX_FRAME_FIFO),
+        .USER_BAD_FRAME_VALUE(1'b1),
+        .USER_BAD_FRAME_MASK(1'b1),
+        .DROP_OVERSIZE_FRAME(TX_DROP_OVERSIZE_FRAME),
+        .DROP_BAD_FRAME(TX_DROP_BAD_FRAME),
+        .DROP_WHEN_FULL(TX_DROP_WHEN_FULL)
     )
-    tx_ptp_ts_fifo (
+    tx_fifo (
         // AXI input
-        .s_clk(tx_clk),
-        .s_rst(tx_rst),
-        .s_axis_tdata(tx_axis_ptp_ts_96),
-        .s_axis_tkeep(0),
-        .s_axis_tvalid(tx_axis_ptp_ts_valid),
-        .s_axis_tready(),
-        .s_axis_tlast(0),
-        .s_axis_tid(tx_axis_ptp_ts_tag),
-        .s_axis_tdest(0),
-        .s_axis_tuser(0),
-
+        .s_clk(logic_clk),
+        .s_rst(logic_rst),
+        .s_axis_tdata (tx_axis_tdata),
+        .s_axis_tkeep (tx_axis_tkeep),
+        .s_axis_tvalid(tx_axis_tvalid),
+        .s_axis_tready(tx_axis_tready),
+        .s_axis_tlast (tx_axis_tlast),
+        .s_axis_tid   (0),
+        .s_axis_tdest (0),
+        .s_axis_tuser (tx_axis_tuser),
         // AXI output
-        .m_clk(logic_clk),
-        .m_rst(logic_rst),
-        .m_axis_tdata(m_axis_tx_ptp_ts_96),
-        .m_axis_tkeep(),
-        .m_axis_tvalid(m_axis_tx_ptp_ts_valid),
-        .m_axis_tready(m_axis_tx_ptp_ts_ready),
-        .m_axis_tlast(),
-        .m_axis_tid(m_axis_tx_ptp_ts_tag),
+        .m_clk(tx_clk),
+        .m_rst(tx_rst),
+        .m_axis_tdata(tx_fifo_axis_tdata),
+        .m_axis_tkeep(tx_fifo_axis_tkeep),
+        .m_axis_tvalid(tx_fifo_axis_tvalid),
+        .m_axis_tready(tx_fifo_axis_tready),
+        .m_axis_tlast(tx_fifo_axis_tlast),
+        .m_axis_tid(),
         .m_axis_tdest(),
-        .m_axis_tuser(),
-
+        .m_axis_tuser(tx_fifo_axis_tuser),
+        // Pause
+        .s_pause_req(1'b0),
+        .s_pause_ack(),
+        .m_pause_req(1'b0),
+        .m_pause_ack(),
         // Status
-        .s_status_overflow(),
-        .s_status_bad_frame(),
-        .s_status_good_frame(),
+        .s_status_overflow(tx_fifo_overflow),
+        .s_status_bad_frame(tx_fifo_bad_frame),
+        .s_status_good_frame(tx_fifo_good_frame),
         .m_status_overflow(),
         .m_status_bad_frame(),
         .m_status_good_frame()
     );
 
-end else begin
 
-    assign m_axis_tx_ptp_ts_96 = {PTP_TS_WIDTH{1'b0}};
-    assign m_axis_tx_ptp_ts_tag = {PTP_TAG_WIDTH{1'b0}};
-    assign m_axis_tx_ptp_ts_valid = 1'b0;
-
-    assign tx_ptp_ts_96 = {PTP_TS_WIDTH{1'b0}};
-
-end
-
-if (PTP_TS_ENABLE) begin : rx_ptp
-
-    ptp_clock_cdc #(
-        .TS_WIDTH(PTP_TS_WIDTH),
-        .NS_WIDTH(6)
+    axis_async_fifo_adapter #(
+        .DEPTH(RX_FIFO_DEPTH),
+        .S_DATA_WIDTH(DATA_WIDTH),
+        .S_KEEP_ENABLE(1),
+        .S_KEEP_WIDTH(KEEP_WIDTH),
+        .M_DATA_WIDTH(AXIS_DATA_WIDTH),
+        .M_KEEP_ENABLE(AXIS_KEEP_ENABLE),
+        .M_KEEP_WIDTH(AXIS_KEEP_WIDTH),
+        .ID_ENABLE(0),
+        .DEST_ENABLE(0),
+        .USER_ENABLE(1),
+        .USER_WIDTH(RX_USER_WIDTH),
+        .RAM_PIPELINE(RX_FIFO_RAM_PIPELINE),
+        .FRAME_FIFO(RX_FRAME_FIFO),
+        .USER_BAD_FRAME_VALUE(1'b1),
+        .USER_BAD_FRAME_MASK(1'b1),
+        .DROP_OVERSIZE_FRAME(RX_DROP_OVERSIZE_FRAME),
+        .DROP_BAD_FRAME(RX_DROP_BAD_FRAME),
+        .DROP_WHEN_FULL(RX_DROP_WHEN_FULL)
     )
-    rx_ptp_cdc (
-        .input_clk(logic_clk),
-        .input_rst(logic_rst),
-        .output_clk(rx_clk),
-        .output_rst(rx_rst),
-        .sample_clk(ptp_sample_clk),
-        .input_ts(ptp_ts_96),
-        .input_ts_step(ptp_ts_step),
-        .output_ts(rx_ptp_ts_96),
-        .output_ts_step(),
-        .output_pps(),
-        .locked()
+    rx_fifo (
+        // AXI input
+        .s_clk(rx_clk),
+        .s_rst(rx_rst),
+        .s_axis_tdata(rx_fifo_axis_tdata),
+        .s_axis_tkeep(rx_fifo_axis_tkeep),
+        .s_axis_tvalid(rx_fifo_axis_tvalid),
+        .s_axis_tready(),
+        .s_axis_tlast(rx_fifo_axis_tlast),
+        .s_axis_tid(0),
+        .s_axis_tdest(0),
+        .s_axis_tuser(rx_fifo_axis_tuser),
+        // AXI output
+        .m_clk(logic_clk),
+        .m_rst(logic_rst),
+        .m_axis_tdata(rx_axis_tdata),
+        .m_axis_tkeep(rx_axis_tkeep),
+        .m_axis_tvalid(rx_axis_tvalid),
+        .m_axis_tready(rx_axis_tready),
+        .m_axis_tlast(rx_axis_tlast),
+        .m_axis_tid(),
+        .m_axis_tdest(),
+        .m_axis_tuser(rx_axis_tuser),
+        // Status
+        .s_status_overflow(),
+        .s_status_bad_frame(),
+        .s_status_good_frame(),
+        .m_status_overflow(rx_fifo_overflow),
+        .m_status_bad_frame(rx_fifo_bad_frame),
+        .m_status_good_frame(rx_fifo_good_frame)
     );
-
-end else begin
-
-    assign rx_ptp_ts_96 = {PTP_TS_WIDTH{1'b0}};
-
-end
-
-endgenerate
-
-eth_mac_10g #(
-    .DATA_WIDTH(DATA_WIDTH),
-    .KEEP_WIDTH(KEEP_WIDTH),
-    .CTRL_WIDTH(CTRL_WIDTH),
-    .ENABLE_PADDING(ENABLE_PADDING),
-    .ENABLE_DIC(ENABLE_DIC),
-    .MIN_FRAME_LENGTH(MIN_FRAME_LENGTH),
-    .PTP_TS_ENABLE(PTP_TS_ENABLE),
-    .PTP_TS_FMT_TOD(PTP_TS_FMT_TOD),
-    .PTP_TS_WIDTH(PTP_TS_WIDTH),
-    .TX_PTP_TS_CTRL_IN_TUSER(TX_PTP_TS_CTRL_IN_TUSER),
-    .TX_PTP_TAG_ENABLE(TX_PTP_TAG_ENABLE),
-    .TX_PTP_TAG_WIDTH(PTP_TAG_WIDTH),
-    .TX_USER_WIDTH(TX_USER_WIDTH),
-    .RX_USER_WIDTH(RX_USER_WIDTH)
-)
-eth_mac_10g_inst (
-    .tx_clk(tx_clk),
-    .tx_rst(tx_rst),
-    .rx_clk(rx_clk),
-    .rx_rst(rx_rst),
-
-    .tx_axis_tdata(tx_fifo_axis_tdata),
-    .tx_axis_tkeep(tx_fifo_axis_tkeep),
-    .tx_axis_tvalid(tx_fifo_axis_tvalid),
-    .tx_axis_tready(tx_fifo_axis_tready),
-    .tx_axis_tlast(tx_fifo_axis_tlast),
-    .tx_axis_tuser(tx_fifo_axis_tuser),
-
-    .rx_axis_tdata(rx_fifo_axis_tdata),
-    .rx_axis_tkeep(rx_fifo_axis_tkeep),
-    .rx_axis_tvalid(rx_fifo_axis_tvalid),
-    .rx_axis_tlast(rx_fifo_axis_tlast),
-    .rx_axis_tuser(rx_fifo_axis_tuser),
-
-    .xgmii_rxd(xgmii_rxd),
-    .xgmii_rxc(xgmii_rxc),
-    .xgmii_txd(xgmii_txd),
-    .xgmii_txc(xgmii_txc),
-
-    .tx_ptp_ts(tx_ptp_ts_96),
-    .rx_ptp_ts(rx_ptp_ts_96),
-    .tx_axis_ptp_ts(tx_axis_ptp_ts_96),
-    .tx_axis_ptp_ts_tag(tx_axis_ptp_ts_tag),
-    .tx_axis_ptp_ts_valid(tx_axis_ptp_ts_valid),
-
-    .tx_error_underflow(tx_error_underflow_int),
-    .rx_error_bad_frame(rx_error_bad_frame_int),
-    .rx_error_bad_fcs(rx_error_bad_fcs_int),
-
-    .cfg_ifg(cfg_ifg),
-    .cfg_tx_enable(cfg_tx_enable),
-    .cfg_rx_enable(cfg_rx_enable)
-);
-
-axis_async_fifo_adapter #(
-    .DEPTH(TX_FIFO_DEPTH),
-    .S_DATA_WIDTH(AXIS_DATA_WIDTH),
-    .S_KEEP_ENABLE(AXIS_KEEP_ENABLE),
-    .S_KEEP_WIDTH(AXIS_KEEP_WIDTH),
-    .M_DATA_WIDTH(DATA_WIDTH),
-    .M_KEEP_ENABLE(1),
-    .M_KEEP_WIDTH(KEEP_WIDTH),
-    .ID_ENABLE(0),
-    .DEST_ENABLE(0),
-    .USER_ENABLE(1),
-    .USER_WIDTH(TX_USER_WIDTH),
-    .RAM_PIPELINE(TX_FIFO_RAM_PIPELINE),
-    .FRAME_FIFO(TX_FRAME_FIFO),
-    .USER_BAD_FRAME_VALUE(1'b1),
-    .USER_BAD_FRAME_MASK(1'b1),
-    .DROP_OVERSIZE_FRAME(TX_DROP_OVERSIZE_FRAME),
-    .DROP_BAD_FRAME(TX_DROP_BAD_FRAME),
-    .DROP_WHEN_FULL(TX_DROP_WHEN_FULL)
-)
-tx_fifo (
-    // AXI input
-    .s_clk(logic_clk),
-    .s_rst(logic_rst),
-    .s_axis_tdata(tx_axis_tdata),
-    .s_axis_tkeep(tx_axis_tkeep),
-    .s_axis_tvalid(tx_axis_tvalid),
-    .s_axis_tready(tx_axis_tready),
-    .s_axis_tlast(tx_axis_tlast),
-    .s_axis_tid(0),
-    .s_axis_tdest(0),
-    .s_axis_tuser(tx_axis_tuser),
-    // AXI output
-    .m_clk(tx_clk),
-    .m_rst(tx_rst),
-    .m_axis_tdata(tx_fifo_axis_tdata),
-    .m_axis_tkeep(tx_fifo_axis_tkeep),
-    .m_axis_tvalid(tx_fifo_axis_tvalid),
-    .m_axis_tready(tx_fifo_axis_tready),
-    .m_axis_tlast(tx_fifo_axis_tlast),
-    .m_axis_tid(),
-    .m_axis_tdest(),
-    .m_axis_tuser(tx_fifo_axis_tuser),
-    // Status
-    .s_status_overflow(tx_fifo_overflow),
-    .s_status_bad_frame(tx_fifo_bad_frame),
-    .s_status_good_frame(tx_fifo_good_frame),
-    .m_status_overflow(),
-    .m_status_bad_frame(),
-    .m_status_good_frame()
-);
-
-axis_async_fifo_adapter #(
-    .DEPTH(RX_FIFO_DEPTH),
-    .S_DATA_WIDTH(DATA_WIDTH),
-    .S_KEEP_ENABLE(1),
-    .S_KEEP_WIDTH(KEEP_WIDTH),
-    .M_DATA_WIDTH(AXIS_DATA_WIDTH),
-    .M_KEEP_ENABLE(AXIS_KEEP_ENABLE),
-    .M_KEEP_WIDTH(AXIS_KEEP_WIDTH),
-    .ID_ENABLE(0),
-    .DEST_ENABLE(0),
-    .USER_ENABLE(1),
-    .USER_WIDTH(RX_USER_WIDTH),
-    .RAM_PIPELINE(RX_FIFO_RAM_PIPELINE),
-    .FRAME_FIFO(RX_FRAME_FIFO),
-    .USER_BAD_FRAME_VALUE(1'b1),
-    .USER_BAD_FRAME_MASK(1'b1),
-    .DROP_OVERSIZE_FRAME(RX_DROP_OVERSIZE_FRAME),
-    .DROP_BAD_FRAME(RX_DROP_BAD_FRAME),
-    .DROP_WHEN_FULL(RX_DROP_WHEN_FULL)
-)
-rx_fifo (
-    // AXI input
-    .s_clk(rx_clk),
-    .s_rst(rx_rst),
-    .s_axis_tdata(rx_fifo_axis_tdata),
-    .s_axis_tkeep(rx_fifo_axis_tkeep),
-    .s_axis_tvalid(rx_fifo_axis_tvalid),
-    .s_axis_tready(),
-    .s_axis_tlast(rx_fifo_axis_tlast),
-    .s_axis_tid(0),
-    .s_axis_tdest(0),
-    .s_axis_tuser(rx_fifo_axis_tuser),
-    // AXI output
-    .m_clk(logic_clk),
-    .m_rst(logic_rst),
-    .m_axis_tdata(rx_axis_tdata),
-    .m_axis_tkeep(rx_axis_tkeep),
-    .m_axis_tvalid(rx_axis_tvalid),
-    .m_axis_tready(rx_axis_tready),
-    .m_axis_tlast(rx_axis_tlast),
-    .m_axis_tid(),
-    .m_axis_tdest(),
-    .m_axis_tuser(rx_axis_tuser),
-    // Status
-    .s_status_overflow(),
-    .s_status_bad_frame(),
-    .s_status_good_frame(),
-    .m_status_overflow(rx_fifo_overflow),
-    .m_status_bad_frame(rx_fifo_bad_frame),
-    .m_status_good_frame(rx_fifo_good_frame)
-);
 
 endmodule
 

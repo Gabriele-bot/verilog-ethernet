@@ -124,6 +124,7 @@ module udp_arb_mux #
 parameter CL_S_COUNT = $clog2(S_COUNT);
 
 reg frame_reg = 1'b0, frame_next;
+reg single_frame_pkt_reg = 1'b0, single_frame_pkt_next;
 
 reg [S_COUNT-1:0] s_udp_hdr_ready_reg = {S_COUNT{1'b0}}, s_udp_hdr_ready_next;
 
@@ -152,7 +153,9 @@ reg [15:0] m_udp_checksum_reg = 16'd0, m_udp_checksum_next;
 wire [S_COUNT-1:0] request;
 wire [S_COUNT-1:0] acknowledge;
 wire [S_COUNT-1:0] grant;
+reg  [   S_COUNT-1:0] grant_del;
 wire grant_valid;
+reg                   grant_valid_del;
 wire [CL_S_COUNT-1:0] grant_encoded;
 
 // internal datapath
@@ -166,9 +169,19 @@ reg  [DEST_WIDTH-1:0] m_udp_payload_axis_tdest_int;
 reg  [USER_WIDTH-1:0] m_udp_payload_axis_tuser_int;
 wire                  m_udp_payload_axis_tready_int_early;
 
+wire [S_COUNT-1:0] ack_hdr;
+reg  [S_COUNT-1:0] ack_hdr_reg;
+wire [S_COUNT-1:0] ack_payload;
+reg  [S_COUNT-1:0] ack_payload_reg;
+
+reg hdr_first;
+reg payload_first;
+
 assign s_udp_hdr_ready = s_udp_hdr_ready_reg;
 
 assign s_udp_payload_axis_tready = (m_udp_payload_axis_tready_int_reg && grant_valid) << grant_encoded;
+//assign s_udp_payload_axis_tready = m_udp_payload_axis_tready_int_reg << grant_encoded;
+
 
 assign m_udp_hdr_valid = m_udp_hdr_valid_reg;
 assign m_eth_dest_mac = m_eth_dest_mac_reg;
@@ -220,11 +233,61 @@ arb_inst (
     .grant_encoded(grant_encoded)
 );
 
-assign request = s_udp_hdr_valid & ~grant;
-assign acknowledge = grant & s_udp_payload_axis_tvalid & s_udp_payload_axis_tready & s_udp_payload_axis_tlast;
+always @(posedge clk) begin
+    grant_del <= grant;
+    grant_valid_del <= grant_valid;
+  end
+  
+// case if tlast comes before hdr_ready
+  assign ack_hdr     = grant & s_udp_hdr_valid & s_udp_hdr_ready;
+  assign ack_payload = grant & s_udp_payload_axis_tvalid & s_udp_payload_axis_tready & s_udp_payload_axis_tlast;
+
+  always @(posedge clk) begin
+
+    if (rst) begin
+      ack_hdr_reg <= 0;
+      ack_payload_reg <= 0;
+      hdr_first <= 1'b0;
+      payload_first <= 1'b0;
+    end else begin
+      // case if hdr comes before tlast (usual case)
+      if (ack_hdr != 0) begin
+        if (ack_hdr != ack_payload && ~payload_first) begin
+           ack_hdr_reg <= ack_hdr;
+           hdr_first <= 1'b1;
+        end
+      end
+      if (ack_hdr_reg != 0) begin
+        if (ack_hdr_reg == ack_payload && hdr_first) begin
+          ack_hdr_reg <= 0;
+          hdr_first <= 1'b0;
+        end
+      end
+
+      // case if tlast comes before hdr (happens if payload is only 1 frame)
+      if (ack_payload != 0) begin
+        if (ack_payload != ack_hdr && ~hdr_first) begin
+          ack_payload_reg <= ack_payload;
+          payload_first <= 1'b1;
+        end
+      end
+      if (ack_payload_reg != 0) begin
+        if (ack_payload_reg == ack_hdr && payload_first) begin
+          ack_payload_reg <= 0;
+          payload_first <= 1'b0;
+        end
+      end
+    end
+  end
+
+//assign request = s_udp_hdr_valid & ~grant;
+assign request = s_udp_hdr_valid & ~grant & ~grant_del;
+//assign acknowledge = grant & s_udp_payload_axis_tvalid & s_udp_payload_axis_tready & s_udp_payload_axis_tlast;
+assign acknowledge = hdr_first ? ack_hdr_reg & ack_payload : (payload_first ? ack_hdr & ack_payload_reg : ack_hdr & ack_payload);
 
 always @* begin
     frame_next = frame_reg;
+    single_frame_pkt_next = single_frame_pkt_reg;
 
     s_udp_hdr_ready_next = {S_COUNT{1'b0}};
 
@@ -251,15 +314,25 @@ always @* begin
     m_udp_checksum_next = m_udp_checksum_reg;
 
     if (s_udp_payload_axis_tvalid[grant_encoded] && s_udp_payload_axis_tready[grant_encoded]) begin
-        // end of frame detection
-        if (s_udp_payload_axis_tlast[grant_encoded]) begin
-            frame_next = 1'b0;
-        end
+      // end of frame detection
+      if (s_udp_payload_axis_tlast[grant_encoded]) begin
+        frame_next = 1'b0;
+      end
+    //end else if (single_frame_pkt_reg) begin
+      //frame_next = 1'b0;
+    end
+    
+    // case if frame_next is stuck to 1'b1
+    if (frame_reg && acknowledge != 0) begin
+      frame_next = 1'b0;
     end
 
-    if (!frame_reg && grant_valid && (m_udp_hdr_ready || !m_udp_hdr_valid)) begin
+
+    if ((!frame_reg) && grant_valid && (m_udp_hdr_ready || !m_udp_hdr_valid)) begin
         // start of frame
         frame_next = 1'b1;
+
+        single_frame_pkt_next = s_udp_payload_axis_tvalid[grant_encoded] & s_udp_payload_axis_tlast[grant_encoded];
 
         s_udp_hdr_ready_next = grant;
 
@@ -285,11 +358,16 @@ always @* begin
         m_udp_length_next = s_udp_length[grant_encoded*16 +: 16];
         m_udp_checksum_next = s_udp_checksum[grant_encoded*16 +: 16];
     end
+    
+    if (single_frame_pkt_reg) begin
+      single_frame_pkt_next = 1'b0;
+    end
 
     // pass through selected packet data
     m_udp_payload_axis_tdata_int  = current_s_tdata;
     m_udp_payload_axis_tkeep_int  = current_s_tkeep;
     m_udp_payload_axis_tvalid_int = current_s_tvalid && m_udp_payload_axis_tready_int_reg && grant_valid;
+    //m_udp_payload_axis_tvalid_int = current_s_tvalid && m_udp_payload_axis_tready_int_reg;
     m_udp_payload_axis_tlast_int  = current_s_tlast;
     m_udp_payload_axis_tid_int    = current_s_tid;
     m_udp_payload_axis_tdest_int  = current_s_tdest;
@@ -361,7 +439,8 @@ assign m_udp_payload_axis_tdest  = DEST_ENABLE ? m_udp_payload_axis_tdest_reg : 
 assign m_udp_payload_axis_tuser  = USER_ENABLE ? m_udp_payload_axis_tuser_reg : {USER_WIDTH{1'b0}};
 
 // enable ready input next cycle if output is ready or if both output registers are empty
-assign m_udp_payload_axis_tready_int_early = m_udp_payload_axis_tready || (!temp_m_udp_payload_axis_tvalid_reg && !m_udp_payload_axis_tvalid_reg);
+//assign m_udp_payload_axis_tready_int_early = m_udp_payload_axis_tready || (!temp_m_udp_payload_axis_tvalid_reg && !m_udp_payload_axis_tvalid_reg);
+assign m_udp_payload_axis_tready_int_early = (m_udp_payload_axis_tready || (!temp_m_udp_payload_axis_tvalid_reg && !m_udp_payload_axis_tvalid_reg)) && grant_valid;
 
 always @* begin
     // transfer sink ready state to source

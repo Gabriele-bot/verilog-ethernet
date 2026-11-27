@@ -114,6 +114,7 @@ module ip_arb_mux #(
   parameter CL_S_COUNT = $clog2(S_COUNT);
 
   reg frame_reg = 1'b0, frame_next;
+  reg single_frame_pkt_reg = 1'b0, single_frame_pkt_next;
 
   reg [S_COUNT-1:0] s_ip_hdr_ready_reg = {S_COUNT{1'b0}}, s_ip_hdr_ready_next;
 
@@ -134,12 +135,14 @@ module ip_arb_mux #(
   reg [15:0] m_ip_header_checksum_reg = 16'd0, m_ip_header_checksum_next;
   reg [31:0] m_ip_source_ip_reg = 32'd0, m_ip_source_ip_next;
   reg [31:0] m_ip_dest_ip_reg = 32'd0, m_ip_dest_ip_next;
-  reg [31:0] m_is_roce_packet_reg = 32'd0, m_is_roce_packet_next;
+  reg        m_is_roce_packet_reg = 1'b0, m_is_roce_packet_next;
 
   wire [   S_COUNT-1:0] request;
   wire [   S_COUNT-1:0] acknowledge;
   wire [   S_COUNT-1:0] grant;
+  reg  [   S_COUNT-1:0] grant_del;
   wire                  grant_valid;
+  reg                   grant_valid_del;
   wire [CL_S_COUNT-1:0] grant_encoded;
 
   // internal datapath
@@ -153,9 +156,18 @@ module ip_arb_mux #(
   reg  [USER_WIDTH-1:0] m_ip_payload_axis_tuser_int;
   wire                  m_ip_payload_axis_tready_int_early;
 
+  wire [S_COUNT-1:0] ack_hdr;
+  reg  [S_COUNT-1:0] ack_hdr_reg;
+  wire [S_COUNT-1:0] ack_payload;
+  reg  [S_COUNT-1:0] ack_payload_reg;
+
+  reg hdr_first;
+  reg payload_first;
+
   assign s_ip_hdr_ready = s_ip_hdr_ready_reg;
 
   assign s_ip_payload_axis_tready = (m_ip_payload_axis_tready_int_reg && grant_valid) << grant_encoded;
+  //assign s_ip_payload_axis_tready = m_ip_payload_axis_tready_int_reg << grant_encoded;
 
   assign m_ip_hdr_valid = m_ip_hdr_valid_reg;
   assign m_eth_dest_mac = m_eth_dest_mac_reg;
@@ -203,11 +215,63 @@ module ip_arb_mux #(
       .grant_encoded(grant_encoded)
   );
 
-  assign request = s_ip_hdr_valid & ~grant;
-  assign acknowledge = grant & s_ip_payload_axis_tvalid & s_ip_payload_axis_tready & s_ip_payload_axis_tlast;
+  always @(posedge clk) begin
+    grant_del <= grant;
+    grant_valid_del <= grant_valid;
+  end
+
+  // case if tlast comes before hdr_ready
+  assign ack_hdr     = grant & s_ip_hdr_valid & s_ip_hdr_ready;
+  assign ack_payload = grant & s_ip_payload_axis_tvalid & s_ip_payload_axis_tready & s_ip_payload_axis_tlast;
+
+  always @(posedge clk) begin
+
+    if (rst) begin
+      ack_hdr_reg <= 0;
+      ack_payload_reg <= 0;
+      hdr_first <= 1'b0;
+      payload_first <= 1'b0;
+    end else begin
+      // case if hdr comes before tlast (usual case)
+      if (ack_hdr != 0) begin
+        if (ack_hdr != ack_payload && ~payload_first) begin
+           ack_hdr_reg <= ack_hdr;
+           hdr_first <= 1'b1;
+        end
+      end
+      if (ack_hdr_reg != 0) begin
+        if (ack_hdr_reg == ack_payload && hdr_first) begin
+          ack_hdr_reg <= 0;
+          hdr_first <= 1'b0;
+        end
+      end
+
+      // case if tlast comes before hdr (happens if payload is only 1 frame)
+      if (ack_payload != 0) begin
+        if (ack_payload != ack_hdr && ~hdr_first) begin
+          ack_payload_reg <= ack_payload;
+          payload_first <= 1'b1;
+        end
+      end
+      if (ack_payload_reg != 0) begin
+        if (ack_payload_reg == ack_hdr && payload_first) begin
+          ack_payload_reg <= 0;
+          payload_first <= 1'b0;
+        end
+      end
+    end
+  end
+
+  
+
+  //assign request = (s_ip_hdr_valid & ~s_ip_hdr_valid_del) & ~grant;
+  assign request = s_ip_hdr_valid & ~grant & ~grant_del;
+  //assign acknowledge = grant & s_ip_payload_axis_tvalid & s_ip_payload_axis_tready & s_ip_payload_axis_tlast;
+  assign acknowledge = hdr_first ? ack_hdr_reg & ack_payload : (payload_first ? ack_hdr & ack_payload_reg : ack_hdr & ack_payload);
 
   always @* begin
     frame_next = frame_reg;
+    single_frame_pkt_next = single_frame_pkt_reg;
 
     s_ip_hdr_ready_next = {S_COUNT{1'b0}};
 
@@ -235,6 +299,13 @@ module ip_arb_mux #(
       if (s_ip_payload_axis_tlast[grant_encoded]) begin
         frame_next = 1'b0;
       end
+    //end else if (single_frame_pkt_reg) begin
+      //frame_next = 1'b0;
+    end
+
+    // case if frame_next is stuck to 1'b1
+    if (frame_reg && acknowledge != 0) begin
+      frame_next = 1'b0;
     end
 
     if (!frame_reg && grant_valid && (m_ip_hdr_ready || !m_ip_hdr_valid)) begin
@@ -242,6 +313,8 @@ module ip_arb_mux #(
       frame_next = 1'b1;
 
       s_ip_hdr_ready_next = grant;
+
+      single_frame_pkt_next = s_ip_payload_axis_tvalid[grant_encoded] & s_ip_payload_axis_tlast[grant_encoded];
 
       m_ip_hdr_valid_next = 1'b1;
       m_eth_dest_mac_next = s_eth_dest_mac[grant_encoded*48+:48];
@@ -263,10 +336,17 @@ module ip_arb_mux #(
       m_is_roce_packet_next = s_is_roce_packet[grant_encoded*1+:1];
     end
 
+    if (single_frame_pkt_reg) begin
+      single_frame_pkt_next = 1'b0;
+    end
+
+    
+
     // pass through selected packet data
     m_ip_payload_axis_tdata_int = current_s_tdata;
     m_ip_payload_axis_tkeep_int = current_s_tkeep;
     m_ip_payload_axis_tvalid_int = current_s_tvalid && m_ip_payload_axis_tready_int_reg && grant_valid;
+    //m_ip_payload_axis_tvalid_int = current_s_tvalid && m_ip_payload_axis_tready_int_reg;
     m_ip_payload_axis_tlast_int = current_s_tlast;
     m_ip_payload_axis_tid_int = current_s_tid;
     m_ip_payload_axis_tdest_int = current_s_tdest;
@@ -275,6 +355,7 @@ module ip_arb_mux #(
 
   always @(posedge clk) begin
     frame_reg <= frame_next;
+    single_frame_pkt_reg <= single_frame_pkt_next;
 
     s_ip_hdr_ready_reg <= s_ip_hdr_ready_next;
 
@@ -299,6 +380,7 @@ module ip_arb_mux #(
 
     if (rst) begin
       frame_reg <= 1'b0;
+      single_frame_pkt_reg <= 1'b0;
       s_ip_hdr_ready_reg <= {S_COUNT{1'b0}};
       m_ip_hdr_valid_reg <= 1'b0;
     end
@@ -335,7 +417,8 @@ module ip_arb_mux #(
   assign m_ip_payload_axis_tuser = USER_ENABLE ? m_ip_payload_axis_tuser_reg : {USER_WIDTH{1'b0}};
 
   // enable ready input next cycle if output is ready or if both output registers are empty
-  assign m_ip_payload_axis_tready_int_early = m_ip_payload_axis_tready || (!temp_m_ip_payload_axis_tvalid_reg && !m_ip_payload_axis_tvalid_reg);
+  //assign m_ip_payload_axis_tready_int_early = m_ip_payload_axis_tready || (!temp_m_ip_payload_axis_tvalid_reg && !m_ip_payload_axis_tvalid_reg)
+  assign m_ip_payload_axis_tready_int_early = (m_ip_payload_axis_tready || (!temp_m_ip_payload_axis_tvalid_reg && !m_ip_payload_axis_tvalid_reg)) && grant_valid;
 
   always @* begin
     // transfer sink ready state to source
